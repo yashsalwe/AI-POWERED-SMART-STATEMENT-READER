@@ -1,0 +1,288 @@
+import streamlit as st
+import camelot
+import pandas as pd
+import tempfile
+import os
+import io
+import pdfplumber
+import google.generativeai as genai
+from PIL import Image
+
+# =================================================================
+#                     CONFIGURATION
+# =================================================================
+API_KEY = " GOOGLE API KEY "  #replace with Your API KEY
+genai.configure(api_key=API_KEY)
+
+# Dummy in-memory feedback store
+feedback_store = []
+
+# =================================================================
+#                     CORE FUNCTIONS
+# =================================================================
+def process_pdf(uploaded_file):
+    """Process PDF using Camelot for tables and pdfplumber for text"""
+    result = {
+        'tables': [],
+        'text': [],
+        'format': None,
+        'confidence': 0,
+        'raw_data': pd.DataFrame(),
+        'num_pages': 0
+    }
+    
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
+        tmp_file.write(uploaded_file.getbuffer())
+        tmp_path = tmp_file.name
+
+    try:
+        # Extract text with pdfplumber
+        with pdfplumber.open(tmp_path) as pdf:
+            result['num_pages'] = len(pdf.pages)
+            for page in pdf.pages:
+                page_text = page.extract_text()
+                if page_text:
+                    result['text'].append(page_text)
+
+        # Extract tables with Camelot using both modes
+        try:
+            tables = camelot.read_pdf(
+                tmp_path, 
+                pages='all',
+                flavor='lattice',  # Fixed flavor parameter
+                strip_text='\n',
+                suppress_stdout=True
+            )
+        except:
+            tables = camelot.read_pdf(
+                tmp_path, 
+                pages='all',
+                flavor='stream',
+                strip_text='\n',
+                suppress_stdout=True
+            )
+        
+        if tables:
+            result['tables'] = [table.df for table in tables]
+            table_conf = min(80 + (len(tables) * 5), 100)
+            text_conf = min(70 + (len(result['text'])*2), 100)
+            result['confidence'] = max(table_conf, text_conf)
+
+        # Detect format using combined text
+        combined_text = "\n".join(result['text'])
+        result['format'] = detect_format(result['tables'], combined_text)
+        
+        # Combine data from all sources
+        all_data = []
+        
+        # Add tables data
+        for table in result['tables']:
+            if not table.empty:
+                all_data.append(table)
+            
+        # Add text data
+        text_df = structure_text_data(combined_text, uploaded_file.name)
+        if not text_df.empty:
+            all_data.append(text_df)
+        
+        if all_data:
+            try:
+                result['raw_data'] = pd.concat(all_data, ignore_index=True)
+            except:
+                result['raw_data'] = pd.concat(all_data, axis=1)
+        else:
+            result['raw_data'] = pd.DataFrame()
+
+    except Exception as e:
+        st.error(f"Processing error: {str(e)}")
+    finally:
+        os.remove(tmp_path)
+    
+    return result
+
+def process_image(uploaded_file):
+    """Process image using Gemini Vision"""
+    img = Image.open(uploaded_file)
+    model = genai.GenerativeModel('gemini-pro-vision')
+    
+    try:
+        response = model.generate_content([
+            "Extract all financial data as key-value pairs. Format as 'Field: Value'.",
+            img
+        ])
+        return {
+            'text': response.text,
+            'format': 'Image Receipt',
+            'confidence': 85,
+            'raw_data': structure_text_data(response.text, uploaded_file.name),
+            'num_pages': 1
+        }
+    except Exception as e:
+        st.error(f"Image processing error: {str(e)}")
+        return None
+
+def detect_format(tables, text):
+    """AI-powered format detection"""
+    model = genai.GenerativeModel('gemini-pro')
+    
+    prompt = f"""Analyze this financial document and classify its format:
+    {text[:3000]}
+
+    Classification Options:
+    - Invoice
+    - Bank Statement
+    - Receipt
+    - Purchase Order
+    - General Ledger
+    - Credit Card Statement
+    - Tax Form
+    - Unknown
+    
+    Return only the classification label."""
+    
+    try:
+        response = model.generate_content(prompt)
+        return response.text.strip()
+    except:
+        return "Unknown"
+
+def structure_text_data(text, filename):
+    """Convert raw text to structured DataFrame"""
+    data = []
+    delimiters = [':', '=', '-', '\t']
+    
+    for line in text.split('\n'):
+        line = line.strip()
+        if any(delim in line for delim in delimiters):
+            for delim in delimiters:
+                if delim in line:
+                    parts = line.split(delim, 1)
+                    field = parts[0].strip()
+                    value = parts[1].strip() if len(parts) > 1 else ''
+                    if field and value:
+                        data.append([filename, field, value])
+                    break
+    return pd.DataFrame(data, columns=['Source', 'Field', 'Value'])
+
+def save_feedback(feedback):
+    """Store feedback for simulated learning"""
+    feedback_store.append(feedback)
+    if len(feedback_store) > 100:
+        feedback_store.pop(0)
+
+# =================================================================
+#                     STREAMLIT INTERFACE
+# =================================================================
+st.set_page_config(page_title="Smart Statement Reader", layout="wide")
+st.title("📑 Smart Statement Reader")
+
+# File upload section
+uploaded_files = st.file_uploader(
+    "Upload financial documents (PDF/Image)",
+    type=["pdf", "png", "jpg", "jpeg"],
+    accept_multiple_files=True
+)
+
+# Initialize session state for processed data
+if 'processed_files' not in st.session_state:
+    st.session_state.processed_files = []
+
+if uploaded_files:
+    for file in uploaded_files:
+        if file not in [f['file'] for f in st.session_state.processed_files]:
+            with st.spinner(f"Processing {file.name}..."):
+                result = None
+                try:
+                    if file.type == "application/pdf":
+                        result = process_pdf(file)
+                    else:
+                        result = process_image(file)
+                except Exception as e:
+                    st.error(f"Failed to process {file.name}: {str(e)}")
+                
+                if result and not result['raw_data'].empty:
+                    st.session_state.processed_files.append({
+                        'file': file,
+                        'result': result
+                    })
+
+# Display processed results
+if st.session_state.processed_files:
+    st.markdown("## Processing Results")
+    all_data = pd.DataFrame()
+    
+    for idx, processed in enumerate(st.session_state.processed_files):
+        file = processed['file']
+        result = processed['result']
+        
+        st.markdown(f"### {file.name} ({result['format']})")
+        col1, col2 = st.columns([1, 3])
+        
+        with col1:
+            st.markdown(f"**Confidence Score:** {result['confidence']}%")
+            st.markdown(f"**Pages Processed:** {result['num_pages']}")
+            if file.type != "application/pdf":
+                st.image(file, use_column_width=True)
+        
+        with col2:
+            if not result['raw_data'].empty:
+                st.dataframe(result['raw_data'].head(50), height=400)
+                all_data = pd.concat([all_data, result['raw_data']], ignore_index=True)
+            else:
+                st.warning("No data extracted from this document")
+            
+        # Feedback section
+        with st.expander(f"Provide Feedback for {file.name}"):
+            feedback = {
+                'filename': file.name,
+                'format': result['format'],
+                'confidence': result['confidence']
+            }
+            
+            feedback['accuracy'] = st.selectbox(
+                "How accurate is this extraction?",
+                ["Perfect", "Mostly Correct", "Partially Correct", "Mostly Wrong"],
+                key=f"fb_acc_{idx}"
+            )
+            
+            feedback['comments'] = st.text_area(
+                "Additional comments (optional):",
+                key=f"fb_com_{idx}"
+            )
+            
+            if st.button("Submit Feedback", key=f"fb_btn_{idx}"):
+                save_feedback(feedback)
+                st.success("Feedback recorded! This will help improve future processing.")
+
+    # Export section
+    if not all_data.empty:
+        st.markdown("## Export Combined Data")
+        
+        csv_data = all_data.to_csv(index=False).encode('utf-8')
+        st.download_button(
+            "Download CSV",
+            csv_data,
+            "financial_data.csv",
+            "text/csv"
+        )
+        
+        excel_buffer = io.BytesIO()
+        with pd.ExcelWriter(excel_buffer, engine='xlsxwriter') as writer:
+            all_data.to_excel(writer, index=False)
+        st.download_button(
+            "Download Excel",
+            excel_buffer.getvalue(),
+            "financial_data.xlsx",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+
+# Display feedback log
+if feedback_store:
+    with st.expander("View Feedback Log"):
+        for idx, fb in enumerate(feedback_store, 1):
+            st.markdown(f"**Entry {idx}:** {fb['filename']}")
+            st.markdown(f"- Format: {fb['format']}")
+            st.markdown(f"- Confidence: {fb['confidence']}%")
+            st.markdown(f"- User Rating: {fb['accuracy']}")
+            if fb['comments']:
+                st.markdown(f"- Comments: {fb['comments']}")
